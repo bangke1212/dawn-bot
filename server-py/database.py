@@ -1,93 +1,102 @@
-import sqlite3, os, threading
-from datetime import datetime, timezone
+import sqlite3, hashlib, os
 
-DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
-DB_PATH = os.path.join(DB_DIR, 'dawnbot.db')
-_local = threading.local()
+DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'dawn.db')
 
-def _conn():
-    if not hasattr(_local, 'c') or _local.c is None:
-        os.makedirs(DB_DIR, exist_ok=True)
-        _local.c = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _local.c.row_factory = sqlite3.Row
-        _local.c.execute("PRAGMA journal_mode=WAL")
-    return _local.c
+def get_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def init_db():
-    c = _conn()
-    c.executescript("""
+def init():
+    conn = get_db()
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS accounts (
-            email TEXT PRIMARY KEY, token TEXT NOT NULL, proxy TEXT DEFAULT '',
+            id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL,
+            token TEXT NOT NULL, app_id TEXT DEFAULT '', proxy TEXT DEFAULT '',
             status TEXT DEFAULT 'active', points INTEGER DEFAULT 0,
-            social_verified INTEGER DEFAULT 0, keepalive_success INTEGER DEFAULT 0,
-            keepalive_fail INTEGER DEFAULT 0, last_keepalive TEXT,
-            created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));
+            social_verified INTEGER DEFAULT 0, last_keepalive TEXT,
+            keepalive_success INTEGER DEFAULT 0, keepalive_fail INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS proxies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT UNIQUE,
-            protocol TEXT DEFAULT 'http', success_count INTEGER DEFAULT 0,
-            fail_count INTEGER DEFAULT 0, last_used TEXT,
-            created_at TEXT DEFAULT (datetime('now')));
+            id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT UNIQUE NOT NULL,
+            protocol TEXT DEFAULT 'http', status TEXT DEFAULT 'untested',
+            success_count INTEGER DEFAULT 0, fail_count INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, account_email TEXT,
-            type TEXT DEFAULT 'info', message TEXT, points INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now')));
-        CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT);
+            type TEXT NOT NULL, message TEXT, points INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, total_keepalives INTEGER DEFAULT 0,
+            total_points INTEGER DEFAULT 0, session_start TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
     """)
-    c.commit()
-    print(f"[DB] OK: {DB_PATH}")
+    if not conn.execute("SELECT id FROM stats ORDER BY id DESC LIMIT 1").fetchone():
+        conn.execute("INSERT INTO stats DEFAULT VALUES")
+    conn.commit(); conn.close()
 
 def get_accounts():
-    return [dict(r) for r in _conn().execute("SELECT * FROM accounts ORDER BY created_at DESC").fetchall()]
+    c = get_db(); rows = c.execute("SELECT * FROM accounts ORDER BY id DESC").fetchall(); c.close()
+    return [dict(r) for r in rows]
 
-def get_account(email):
-    r = _conn().execute("SELECT * FROM accounts WHERE email=?", (email,)).fetchone()
-    return dict(r) if r else None
+def add_account(email, token, proxy=''):
+    app_id = '6752b' + hashlib.md5(token.encode()).hexdigest()[:19]
+    c = get_db()
+    c.execute("INSERT OR REPLACE INTO accounts (email, token, app_id, proxy) VALUES (?,?,?,?)",
+              (email, token, app_id, proxy))
+    c.commit(); c.close()
 
-def add_account(email, token, proxy='', status='active'):
-    c = _conn()
-    c.execute("INSERT OR REPLACE INTO accounts (email,token,proxy,status) VALUES (?,?,?,?)", (email,token,proxy,status))
-    c.commit()
-    return get_account(email)
-
-def update_account(email, **kw):
-    if not kw: return
-    c = _conn()
-    sets = ', '.join(f"{k}=?" for k in kw)
-    c.execute(f"UPDATE accounts SET {sets}, updated_at=datetime('now') WHERE email=?", list(kw.values())+[email])
-    c.commit()
+def update_account(email, data):
+    if not data: return
+    sets = ', '.join(f"{k}=?" for k in data)
+    c = get_db()
+    c.execute(f"UPDATE accounts SET {sets}, updated_at=datetime('now') WHERE email=?",
+              list(data.values()) + [email])
+    c.commit(); c.close()
 
 def delete_account(email):
-    c = _conn(); c.execute("DELETE FROM accounts WHERE email=?",(email,)); c.commit()
+    c = get_db(); c.execute("DELETE FROM accounts WHERE email=?", (email,)); c.commit(); c.close()
 
 def get_proxies():
-    return [dict(r) for r in _conn().execute("SELECT * FROM proxies ORDER BY created_at DESC").fetchall()]
+    c = get_db(); rows = c.execute("SELECT * FROM proxies ORDER BY id DESC").fetchall(); c.close()
+    return [dict(r) for r in rows]
 
 def add_proxy(url):
-    p = 'socks5' if url.startswith('socks') else 'http'
-    _conn().execute("INSERT OR IGNORE INTO proxies (url,protocol) VALUES (?,?)",(url,p)); _conn().commit()
+    proto = url.split('://')[0] if '://' in url else 'http'
+    full = url if '://' in url else f'http://{url}'
+    c = get_db(); c.execute("INSERT OR IGNORE INTO proxies (url,protocol) VALUES (?,?)", (full, proto)); c.commit(); c.close()
 
 def delete_proxy(pid):
-    _conn().execute("DELETE FROM proxies WHERE id=?",(pid,)); _conn().commit()
+    c = get_db(); c.execute("DELETE FROM proxies WHERE id=?", (pid,)); c.commit(); c.close()
 
-def get_random_proxy():
-    r = _conn().execute("SELECT * FROM proxies ORDER BY RANDOM() LIMIT 1").fetchone()
-    return dict(r) if r else None
+def add_log(email, t, msg, pts=0):
+    c = get_db(); c.execute("INSERT INTO logs (account_email,type,message,points) VALUES (?,?,?,?)",
+                            (email, t, msg, pts)); c.commit(); c.close()
 
-def add_log(email, type_, msg, pts=0):
-    c = _conn()
-    c.execute("INSERT INTO logs (account_email,type,message,points) VALUES (?,?,?,?)",(email,type_,msg,pts))
-    c.commit()
-    c.execute("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT 2000)"); c.commit()
+def get_logs(limit=100):
+    c = get_db(); rows = c.execute("SELECT * FROM logs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall(); c.close()
+    return [dict(r) for r in rows]
 
-def get_logs(limit=30):
-    return [dict(r) for r in _conn().execute("SELECT * FROM logs ORDER BY id DESC LIMIT ?",(limit,)).fetchall()]
+def get_account_logs(email, limit=50):
+    c = get_db(); rows = c.execute("SELECT * FROM logs WHERE account_email=? ORDER BY created_at DESC LIMIT ?",
+                                   (email, limit)).fetchall(); c.close()
+    return [dict(r) for r in rows]
 
-def get_bot_state():
-    s = {}
-    for k in ['running','total_keepalives','interval']:
-        r = _conn().execute("SELECT value FROM bot_state WHERE key=?",(k,)).fetchone()
-        s[k] = r['value'] if r else '0'
-    return s
+def get_stats():
+    c = get_db(); row = c.execute("SELECT * FROM stats ORDER BY id DESC LIMIT 1").fetchone(); c.close()
+    return dict(row) if row else {}
 
-def set_bot_state(k, v):
-    _conn().execute("INSERT OR REPLACE INTO bot_state VALUES (?,?)",(k,str(v))); _conn().commit()
+def update_stats(data):
+    if not data: return
+    sets = ', '.join(f"{k}=?" for k in data)
+    c = get_db()
+    c.execute(f"UPDATE stats SET {sets}, updated_at=datetime('now') WHERE id=(SELECT id FROM stats ORDER BY id DESC LIMIT 1)",
+              list(data.values()))
+    c.commit(); c.close()
+
+init()
